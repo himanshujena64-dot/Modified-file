@@ -19,6 +19,37 @@ import streamlit as st
 # PAGE CONFIG
 # ═══════════════════════════════════════════════════════════════
 st.set_page_config(page_title="SAP MRP Engine", page_icon="⚙️", layout="wide")
+
+# ═══════════════════════════════════════════════════════════════
+# LOGIN WALL  — credentials stored in Streamlit secrets
+# secrets.toml:  admin_id = "admin"   admin_password = "admin@2040"
+# ═══════════════════════════════════════════════════════════════
+def check_login():
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("⚙️ SAP MRP Engine")
+    st.subheader("🔐 Login")
+
+    with st.form("login_form"):
+        user_id  = st.text_input("User ID")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", use_container_width=True)
+
+    if submitted:
+        valid_id  = st.secrets.get("admin_id",       "admin")
+        valid_pwd = st.secrets.get("admin_password",  "admin@2040")
+        if user_id.strip() == valid_id and password == valid_pwd:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Invalid User ID or Password.")
+
+    return False
+
+if not check_login():
+    st.stop()
+
 st.title("⚙️ SAP MRP Engine — L1 to L4")
 st.caption("Phantom handling · Alt-aware · NET propagation · Date-wise shortage")
 
@@ -431,25 +462,34 @@ def show_search_section(bom, fg_demand_df, date_cols, stock, prod_summary):
                       Stock_Remaining=("Stock_Remaining","last")))
         daily["_ord"] = daily["Month"].map(dc_order)
         daily = daily.sort_values("_ord").drop(columns="_ord")
-        daily["Cumulative Shortage"] = daily["Shortage"].cumsum()
-        daily = daily.rename(columns={"Month":"Date"})
+        daily["Cumul. Shortage / Excess"] = daily["Shortage"].cumsum()
+        daily = daily.rename(columns={
+            "Month":"Date",
+            "Shortage":"Shortage(+) / Excess(-)"
+        })
 
         def hl(row):
-            c = "background-color:#ffe0e0" if row["Shortage"]>0 else ""
-            return [c]*len(row)
+            val = row["Shortage(+) / Excess(-)"]
+            if val > 0:
+                return ["background-color:#ffe0e0"]*len(row)   # red  = shortage
+            elif val < 0:
+                return ["background-color:#e0f7e0"]*len(row)   # green = excess
+            return [""]*len(row)
 
         st.dataframe(
             daily.style.apply(hl, axis=1).format({
                 "Gross_Requirement":"{:,.2f}","Stock_Used":"{:,.2f}",
-                "Shortage":"{:,.2f}","Stock_Remaining":"{:,.2f}",
-                "Cumulative Shortage":"{:,.2f}"}),
+                "Shortage(+) / Excess(-)":"{:,.2f}","Stock_Remaining":"{:,.2f}",
+                "Cumul. Shortage / Excess":"{:,.2f}"}),
             use_container_width=True, hide_index=True)
 
         s1,s2,s3,s4 = st.columns(4)
         s1.metric("Total gross req",    f"{daily['Gross_Requirement'].sum():,.2f}")
         s2.metric("Stock consumed",     f"{daily['Stock_Used'].sum():,.2f}")
-        s3.metric("Total shortage",     f"{daily['Shortage'].sum():,.2f}")
-        s4.metric("Days with shortage", f"{(daily['Shortage']>0).sum()} / {len(daily)}")
+        total_short = daily[daily["Shortage(+) / Excess(-)"]>0]["Shortage(+) / Excess(-)"].sum()
+        total_excess = abs(daily[daily["Shortage(+) / Excess(-)"]<0]["Shortage(+) / Excess(-)"].sum())
+        s3.metric("Total shortage",     f"{total_short:,.2f}")
+        s4.metric("Total excess stock", f"{total_excess:,.2f}")
     else:
         st.info("Component in BOM but not in MRP results (phantom or no demand).")
 
@@ -625,6 +665,7 @@ def run_mrp(export_file, stock_file, bom_file, receipt_file):
             avail = float(stock.get(comp2, 0))
             for _, row in grp.sort_values("Month_Order").iterrows():
                 g = float(row[gross_col])
+                # sfrac = fraction of demand NOT covered (0 when excess, >0 when shortage)
                 sfrac[(comp2, row["Month"])] = max(0.0, g-avail)/g if g>0 else 0.0
                 avail = max(0.0, avail-g)
         return sfrac
@@ -641,7 +682,8 @@ def run_mrp(export_file, stock_file, bom_file, receipt_file):
             for _, row in grp.sort_values("Month_Order").iterrows():
                 gr       = float(row["Gross"])
                 consumed = min(avail, gr)
-                shortage = max(0.0, gr-avail)
+                # Positive = shortage, Negative = excess (surplus stock over demand)
+                shortage = gr - avail
                 avail    = max(0.0, avail-gr)
                 results.append({
                     "Component":comp2, "Description":desc, "Month":row["Month"],
@@ -740,10 +782,12 @@ def run_mrp(export_file, stock_file, bom_file, receipt_file):
     c1,c2,c3,c4 = st.columns(4)
     for col_ui,lbl,dfr in zip([c1,c2,c3,c4],["L1","L2","L3","L4"],
                                [result_l1,result_l2,result_l3,result_l4]):
-        short = dfr[dfr["Shortage"]>0]["Component"].nunique() if not dfr.empty else 0
+        shortage_comps = dfr[dfr["Shortage"]>0]["Component"].nunique() if not dfr.empty else 0
+        excess_comps   = dfr[dfr["Shortage"]<0]["Component"].nunique() if not dfr.empty else 0
         with col_ui:
             st.metric(f"L{lbl[-1]} components", dfr["Component"].nunique() if not dfr.empty else 0)
-            st.metric("With shortage", short)
+            st.metric("🔴 Shortage", shortage_comps)
+            st.metric("🟢 Excess",   excess_comps)
 
     # ── SECTION 8: EXPORT ─────────────────────────────────────
     final_output = pd.concat([result_l1,result_l2,result_l3,result_l4], ignore_index=True)
@@ -759,7 +803,9 @@ def run_mrp(export_file, stock_file, bom_file, receipt_file):
     # Only keep date columns present in data, in chronological order
     date_out_cols = [d for d in date_cols if d in pivot.columns]
 
-    # Cumulative shortage: carry-forward (if demand only on day 1, shortage stays in later days)
+    # Cumulative carry-forward:
+    # Positive values = shortage, Negative values = excess (surplus stock over demand)
+    # cumsum preserves sign — excess in early dates reduces later shortage correctly
     if date_out_cols:
         pivot[date_out_cols] = pivot[date_out_cols].cumsum(axis=1)
 
@@ -806,7 +852,7 @@ def run_mrp(export_file, stock_file, bom_file, receipt_file):
     st.subheader("📋 Output preview")
     st.dataframe(pivot.head(200), use_container_width=True)
     st.caption(f"{len(pivot):,} rows · {len(date_out_cols)} date columns · "
-               f"cumulative shortage carried forward")
+               f"positive = shortage · negative = excess stock")
 
     buf = io.BytesIO()
     pivot.to_excel(buf, index=False, engine="openpyxl")
