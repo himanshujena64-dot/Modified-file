@@ -462,34 +462,38 @@ def show_search_section(bom, fg_demand_df, date_cols, stock, prod_summary):
                       Stock_Remaining=("Stock_Remaining","last")))
         daily["_ord"] = daily["Month"].map(dc_order)
         daily = daily.sort_values("_ord").drop(columns="_ord")
-        daily["Cumul. Shortage / Excess"] = daily["Shortage"].cumsum()
-        daily = daily.rename(columns={
-            "Month":"Date",
-            "Shortage":"Shortage(+) / Excess(-)"
-        })
+
+        # Cumulative gross demand, then Net Position = Stock - cumulative demand
+        daily["Cumul_Gross"] = daily["Gross_Requirement"].cumsum()
+        daily["Net_Position"] = stk - daily["Cumul_Gross"]
+        # Positive = surplus balance  |  Negative = shortage
+        daily = daily.rename(columns={"Month":"Date"})
 
         def hl(row):
-            val = row["Shortage(+) / Excess(-)"]
-            if val > 0:
+            if row["Net_Position"] < 0:
                 return ["background-color:#ffe0e0"]*len(row)   # red  = shortage
-            elif val < 0:
-                return ["background-color:#e0f7e0"]*len(row)   # green = excess
+            elif row["Net_Position"] > 0:
+                return ["background-color:#e8f8e8"]*len(row)   # green = surplus
             return [""]*len(row)
 
+        display_cols = ["Date","Gross_Requirement","Stock_Used",
+                        "Stock_Remaining","Net_Position"]
         st.dataframe(
-            daily.style.apply(hl, axis=1).format({
+            daily[display_cols].style.apply(hl, axis=1).format({
                 "Gross_Requirement":"{:,.2f}","Stock_Used":"{:,.2f}",
-                "Shortage(+) / Excess(-)":"{:,.2f}","Stock_Remaining":"{:,.2f}",
-                "Cumul. Shortage / Excess":"{:,.2f}"}),
+                "Stock_Remaining":"{:,.2f}","Net_Position":"{:,.2f}"}),
             use_container_width=True, hide_index=True)
+        st.caption("Net Position = Stock − cumulative gross demand | "
+                   "🟢 positive = surplus · 🔴 negative = shortage")
 
         s1,s2,s3,s4 = st.columns(4)
-        s1.metric("Total gross req",    f"{daily['Gross_Requirement'].sum():,.2f}")
-        s2.metric("Stock consumed",     f"{daily['Stock_Used'].sum():,.2f}")
-        total_short = daily[daily["Shortage(+) / Excess(-)"]>0]["Shortage(+) / Excess(-)"].sum()
-        total_excess = abs(daily[daily["Shortage(+) / Excess(-)"]<0]["Shortage(+) / Excess(-)"].sum())
-        s3.metric("Total shortage",     f"{total_short:,.2f}")
-        s4.metric("Total excess stock", f"{total_excess:,.2f}")
+        s1.metric("Total gross req",  f"{daily['Gross_Requirement'].sum():,.2f}")
+        s2.metric("Opening stock",    f"{stk:,.2f}")
+        final_net = daily["Net_Position"].iloc[-1]
+        s3.metric("Final net position", f"{final_net:,.2f}",
+                  delta="surplus" if final_net >= 0 else "shortage",
+                  delta_color="normal" if final_net >= 0 else "inverse")
+        s4.metric("Days in shortage", f"{(daily['Net_Position']<0).sum()} / {len(daily)}")
     else:
         st.info("Component in BOM but not in MRP results (phantom or no demand).")
 
@@ -793,22 +797,24 @@ def run_mrp(export_file, stock_file, bom_file, receipt_file):
     final_output = pd.concat([result_l1,result_l2,result_l3,result_l4], ignore_index=True)
     all_comps = final_output[["Component","Description"]].drop_duplicates(subset="Component").copy()
 
-    # Pivot: component × date (shortage per date)
-    pivot = (final_output
-             .pivot_table(index=["Component","Description"], columns="Month",
-                          values="Shortage", aggfunc="sum", fill_value=0)
-             .reset_index())
-    pivot = all_comps.merge(pivot, on=["Component","Description"], how="left").fillna(0)
+    # ── Net Position calculation ──────────────────────────────
+    # Pivot GROSS REQUIREMENT (not shortage) per date
+    pivot_gross = (
+        final_output
+        .pivot_table(index=["Component","Description"], columns="Month",
+                     values="Gross_Requirement", aggfunc="sum", fill_value=0)
+        .reset_index()
+    )
+    pivot = all_comps.merge(pivot_gross, on=["Component","Description"], how="left").fillna(0)
 
     # Only keep date columns present in data, in chronological order
     date_out_cols = [d for d in date_cols if d in pivot.columns]
 
-    # Cumulative carry-forward:
-    # Positive values = shortage, Negative values = excess (surplus stock over demand)
-    # cumsum preserves sign — excess in early dates reduces later shortage correctly
+    # cumsum across dates = cumulative gross demand up to each date
     if date_out_cols:
         pivot[date_out_cols] = pivot[date_out_cols].cumsum(axis=1)
 
+    # Merge stock and master data first so we can compute Net Position
     bom_master = (bom[["Component","Procurement type","Special procurement"]]
                   .drop_duplicates(subset="Component"))
     stock_df   = stock.reset_index().rename(columns={"Stock_Qty":"Stock"})
@@ -824,6 +830,12 @@ def run_mrp(export_file, stock_file, bom_file, receipt_file):
     pivot["Confirmed_Qty"]       = pivot["Confirmed_Qty"].fillna(0)
     pivot["Open_Production_Qty"] = pivot["Open_Production_Qty"].fillna(0)
     pivot["Plan_Order_Qty"]      = pivot["Plan_Order_Qty"].fillna(0)
+
+    # Net Position = Stock − cumulative demand (per date)
+    #   Positive → surplus / available balance on that date
+    #   Negative → shortage (demand exceeds available stock)
+    for d in date_out_cols:
+        pivot[d] = pivot["Stock"] - pivot[d]
 
     if not receipt_qty.empty:
         rq_df = receipt_qty.reset_index()
@@ -852,7 +864,7 @@ def run_mrp(export_file, stock_file, bom_file, receipt_file):
     st.subheader("📋 Output preview")
     st.dataframe(pivot.head(200), use_container_width=True)
     st.caption(f"{len(pivot):,} rows · {len(date_out_cols)} date columns · "
-               f"positive = shortage · negative = excess stock")
+               f"positive = surplus stock · negative = shortage")
 
     buf = io.BytesIO()
     pivot.to_excel(buf, index=False, engine="openpyxl")
